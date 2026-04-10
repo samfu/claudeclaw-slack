@@ -32,13 +32,17 @@ jobs:
         working-directory: claudeclaw
         run: npm ci
 
+      - name: Install extension deps
+        working-directory: claudeclaw/extensions/claudeclaw-slack
+        run: npm install
+
       - name: Build core (generates .d.ts that the extension imports)
         working-directory: claudeclaw
         run: npm run build
 
       - name: Build extension
-        working-directory: claudeclaw
-        run: npx tsc -p extensions/claudeclaw-slack/tsconfig.json
+        working-directory: claudeclaw/extensions/claudeclaw-slack
+        run: npx tsc
 
       - name: Run extension tests
         working-directory: claudeclaw

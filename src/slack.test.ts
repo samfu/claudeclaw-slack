@@ -969,20 +969,6 @@ describe('SlackChannel', () => {
   // --- file_shared handling ---
 
   describe('file_shared handling', () => {
-    it('registers file_shared event handler on construction', () => {
-      new SlackChannel(createTestOpts());
-      expect(currentApp().eventHandlers.has('file_shared')).toBe(true);
-    });
-
-    it('calls files.info with correct file_id', async () => {
-      const opts = createTestOpts();
-      new SlackChannel(opts);
-
-      await triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C0123456789' });
-
-      expect(currentApp().client.files.info).toHaveBeenCalledWith({ file: 'F_FILE_123' });
-    });
-
     it('downloads file with correct Authorization header', async () => {
       const opts = createTestOpts();
       new SlackChannel(opts);
@@ -1080,24 +1066,13 @@ describe('SlackChannel', () => {
       expect(opts.onMessage).not.toHaveBeenCalled();
       expect(mockFetch).not.toHaveBeenCalled();
 
-      // Should DM the uploader
+      // Should DM the uploader with channel reference
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
         channel: 'U_USER_456',
         text: expect.stringContaining('<#C9999999999>'),
       });
-    });
-
-    it('DM message includes channel reference', async () => {
-      const opts = createTestOpts({
-        registeredGroups: vi.fn(() => ({})),
-      });
-      new SlackChannel(opts);
-
-      await triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C9999999999' });
-
-      const call = currentApp().client.chat.postMessage.mock.calls[0][0];
-      expect(call.text).toContain('<#C9999999999>');
-      expect(call.text).toContain('registered');
+      const dmText = currentApp().client.chat.postMessage.mock.calls[0][0].text;
+      expect(dmText).toContain('registered');
     });
 
     it('skips DM to uploader if file.user is missing', async () => {

@@ -37,8 +37,8 @@ jobs:
         run: npm run build
 
       - name: Build extension
-        working-directory: claudeclaw/extensions/claudeclaw-slack
-        run: npx tsc
+        working-directory: claudeclaw
+        run: npx tsc -p extensions/claudeclaw-slack/tsconfig.json
 
       - name: Run extension tests
         working-directory: claudeclaw

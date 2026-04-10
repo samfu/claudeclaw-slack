@@ -1,0 +1,45 @@
+name: Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout claudeclaw core
+        uses: actions/checkout@v4
+        with:
+          repository: samfu/claudeclaw
+          path: claudeclaw
+
+      - name: Checkout claudeclaw-slack at PR
+        uses: actions/checkout@v4
+        with:
+          path: claudeclaw/extensions/claudeclaw-slack
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: claudeclaw/package-lock.json
+
+      - name: Install core deps
+        working-directory: claudeclaw
+        run: npm ci
+
+      - name: Build core (generates .d.ts that the extension imports)
+        working-directory: claudeclaw
+        run: npm run build
+
+      - name: Build extension
+        working-directory: claudeclaw/extensions/claudeclaw-slack
+        run: npx tsc
+
+      - name: Run extension tests
+        working-directory: claudeclaw
+        run: npx vitest run --dir extensions/claudeclaw-slack

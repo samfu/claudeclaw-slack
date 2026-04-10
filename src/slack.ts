@@ -82,6 +82,19 @@ export class SlackChannel implements Channel {
       const subtype = (event as { subtype?: string }).subtype;
       // Skip list_record_comment — list items are status display only
       if (subtype === 'list_record_comment') return;
+
+      // file_share messages accompany file uploads — capture the ts so the
+      // typing-indicator reaction can attach to the upload message, then bail.
+      // The actual file processing happens in the file_shared event handler.
+      if (subtype === 'file_share') {
+        const msg = event as GenericMessageEvent;
+        if (msg.channel && msg.ts) {
+          const jid = `slack:${msg.channel}`;
+          this.lastMessageTs.set(jid, msg.ts);
+        }
+        return;
+      }
+
       if (subtype && subtype !== 'bot_message') return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent

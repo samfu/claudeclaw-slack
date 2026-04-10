@@ -9,6 +9,7 @@ vi.mock('../../../dist/orchestrator/channel-registry.js', () => ({ registerChann
 vi.mock('../../../dist/orchestrator/config.js', () => ({
   ASSISTANT_NAME: 'Jonesy',
   TRIGGER_PATTERN: /^@Jonesy\b/i,
+  GROUPS_DIR: '/test/groups',
 }));
 
 // Mock logger
@@ -24,6 +25,12 @@ vi.mock('../../../dist/orchestrator/logger.js', () => ({
 // Mock db
 vi.mock('../../../dist/orchestrator/db.js', () => ({
   updateChatName: vi.fn(),
+}));
+
+// Mock node:fs/promises
+vi.mock('node:fs/promises', () => ({
+  mkdir: vi.fn().mockResolvedValue(undefined),
+  writeFile: vi.fn().mockResolvedValue(undefined),
 }));
 
 // --- @slack/bolt mock ---
@@ -58,6 +65,18 @@ vi.mock('@slack/bolt', () => ({
           user: { real_name: 'Alice Smith', name: 'alice' },
         }),
       },
+      files: {
+        info: vi.fn().mockResolvedValue({
+          file: {
+            id: 'F_FILE_123',
+            name: 'report.pdf',
+            url_private_download: 'https://files.slack.com/files-pri/T123/F123/report.pdf',
+            mimetype: 'application/pdf',
+            size: 204800, // 200 KB
+            user: 'U_USER_456',
+          },
+        }),
+      },
     };
 
     constructor(opts: any) {
@@ -87,6 +106,7 @@ vi.mock('../../../dist/orchestrator/env.js', () => ({
 import { SlackChannel, SlackChannelOpts } from './slack.js';
 import { updateChatName } from '../../../dist/orchestrator/db.js';
 import { readEnvFile } from '../../../dist/orchestrator/env.js';
+import * as fs from 'node:fs/promises';
 
 // --- Test helpers ---
 
@@ -141,15 +161,35 @@ async function triggerMessageEvent(
   if (handler) await handler({ event });
 }
 
+async function triggerFileSharedEvent(event: {
+  file_id?: string;
+  channel_id?: string;
+}) {
+  const handler = currentApp().eventHandlers.get('file_shared');
+  if (handler) await handler({ event });
+}
+
+// --- Mock fetch ---
+
+let mockFetch: ReturnType<typeof vi.fn>;
+
 // --- Tests ---
 
 describe('SlackChannel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      arrayBuffer: vi.fn().mockResolvedValue(new ArrayBuffer(1024)),
+    });
+    vi.stubGlobal('fetch', mockFetch);
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   // --- Connection lifecycle ---
@@ -923,6 +963,282 @@ describe('SlackChannel', () => {
     it('has name "slack"', () => {
       const channel = new SlackChannel(createTestOpts());
       expect(channel.name).toBe('slack');
+    });
+  });
+
+  // --- file_shared handling ---
+
+  describe('file_shared handling', () => {
+    it('downloads file with correct Authorization header', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C0123456789' });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://files.slack.com/files-pri/T123/F123/report.pdf',
+        { headers: { Authorization: 'Bearer xoxb-test-token' } },
+      );
+    });
+
+    it('writes file to correct path using GROUPS_DIR and group folder', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C0123456789' });
+
+      expect(fs.mkdir).toHaveBeenCalledWith('/test/groups/test-channel/files', { recursive: true });
+      expect(fs.writeFile).toHaveBeenCalledWith(
+        '/test/groups/test-channel/files/report.pdf',
+        expect.any(Buffer),
+      );
+    });
+
+    it('calls onMessage with prompt containing container path and mimetype (no token)', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C0123456789' });
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          chat_jid: 'slack:C0123456789',
+          sender_name: 'slack-file-upload',
+          is_from_me: false,
+          is_bot_message: false,
+        }),
+      );
+
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toContain('/workspace/group/files/report.pdf');
+      expect(content).toContain('application/pdf');
+      expect(content).toContain('200.0 KB');
+      expect(content).not.toContain('xoxb-test-token');
+    });
+
+    it('includes summary instruction for readable mimetypes', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      // Default mock returns application/pdf which is readable
+      await triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C0123456789' });
+
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toContain('readable format');
+      expect(content).toContain('summary');
+    });
+
+    it('omits summary instruction for binary mimetypes', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      currentApp().client.files.info.mockResolvedValueOnce({
+        file: {
+          id: 'F_FILE_456',
+          name: 'photo.png',
+          url_private_download: 'https://files.slack.com/files-pri/T123/F456/photo.png',
+          mimetype: 'image/png',
+          size: 102400,
+          user: 'U_USER_456',
+        },
+      });
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_456', channel_id: 'C0123456789' });
+
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toContain('binary file');
+      expect(content).not.toContain('readable format');
+    });
+
+    it('DMs the uploader when channel is unregistered', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({})), // no registered groups
+      });
+      new SlackChannel(opts);
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C9999999999' });
+
+      // Should NOT call onMessage or fetch
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Should DM the uploader with channel reference
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'U_USER_456',
+        text: expect.stringContaining('<#C9999999999>'),
+      });
+      const dmText = currentApp().client.chat.postMessage.mock.calls[0][0].text;
+      expect(dmText).toContain('registered');
+    });
+
+    it('skips DM to uploader if file.user is missing', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({})),
+      });
+      new SlackChannel(opts);
+
+      currentApp().client.files.info.mockResolvedValueOnce({
+        file: {
+          id: 'F_FILE_789',
+          name: 'mystery.pdf',
+          url_private_download: 'https://files.slack.com/files-pri/T123/F789/mystery.pdf',
+          mimetype: 'application/pdf',
+          size: 1024,
+          // no user field
+        },
+      });
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_789', channel_id: 'C9999999999' });
+
+      expect(currentApp().client.chat.postMessage).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('skips files with no url_private_download', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      currentApp().client.files.info.mockResolvedValueOnce({
+        file: {
+          id: 'F_FILE_NO_URL',
+          name: 'no-download.pdf',
+          // no url_private_download
+          mimetype: 'application/pdf',
+          size: 1024,
+          user: 'U_USER_456',
+        },
+      });
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_NO_URL', channel_id: 'C0123456789' });
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('sanitizes dangerous filenames', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      currentApp().client.files.info.mockResolvedValueOnce({
+        file: {
+          id: 'F_FILE_DANGER',
+          name: '../../../etc/passwd',
+          url_private_download: 'https://files.slack.com/files-pri/T123/F_DANGER/passwd',
+          mimetype: 'text/plain',
+          size: 1024,
+          user: 'U_USER_456',
+        },
+      });
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_DANGER', channel_id: 'C0123456789' });
+
+      // path.basename strips directory traversal, then regex strips remaining unsafe chars
+      expect(fs.writeFile).toHaveBeenCalledWith(
+        '/test/groups/test-channel/files/passwd',
+        expect.any(Buffer),
+      );
+    });
+
+    it('rejects empty post-sanitization filenames', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      currentApp().client.files.info.mockResolvedValueOnce({
+        file: {
+          id: 'F_FILE_EMPTY',
+          name: '////',
+          url_private_download: 'https://files.slack.com/files-pri/T123/F_EMPTY/file',
+          mimetype: 'application/octet-stream',
+          size: 1024,
+          user: 'U_USER_456',
+        },
+      });
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_EMPTY', channel_id: 'C0123456789' });
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('rejects files over 50MB with notification', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      currentApp().client.files.info.mockResolvedValueOnce({
+        file: {
+          id: 'F_FILE_BIG',
+          name: 'huge-video.mp4',
+          url_private_download: 'https://files.slack.com/files-pri/T123/F_BIG/huge-video.mp4',
+          mimetype: 'video/mp4',
+          size: 60 * 1024 * 1024, // 60 MB
+          user: 'U_USER_456',
+        },
+      });
+
+      await triggerFileSharedEvent({ file_id: 'F_FILE_BIG', channel_id: 'C0123456789' });
+
+      // Should NOT download
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // Should notify via onMessage about the limit
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          content: expect.stringContaining('exceeds the 50 MB limit'),
+        }),
+      );
+    });
+
+    it('handles files.info errors gracefully', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      currentApp().client.files.info.mockRejectedValueOnce(new Error('API error'));
+
+      // Should not throw
+      await expect(
+        triggerFileSharedEvent({ file_id: 'F_FILE_ERR', channel_id: 'C0123456789' }),
+      ).resolves.toBeUndefined();
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('handles fetch download errors gracefully', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+      });
+
+      // Should not throw
+      await expect(
+        triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C0123456789' }),
+      ).resolves.toBeUndefined();
+
+      expect(fs.writeFile).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('handles fs.writeFile errors gracefully', async () => {
+      const opts = createTestOpts();
+      new SlackChannel(opts);
+
+      vi.mocked(fs.writeFile).mockRejectedValueOnce(new Error('ENOSPC'));
+
+      // Should not throw
+      await expect(
+        triggerFileSharedEvent({ file_id: 'F_FILE_123', channel_id: 'C0123456789' }),
+      ).resolves.toBeUndefined();
+
+      // onMessage should NOT have been called since the write failed before we got there
+      expect(opts.onMessage).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,7 +1,9 @@
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../../../dist/orchestrator/config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN, GROUPS_DIR } from '../../../dist/orchestrator/config.js';
 import { updateChatName } from '../../../dist/orchestrator/db.js';
 import { readEnvFile } from '../../../dist/orchestrator/env.js';
 import { logger } from '../../../dist/orchestrator/logger.js';
@@ -16,6 +18,9 @@ import type {
 // Slack's chat.postMessage API limits text to ~4000 characters per call.
 // Messages exceeding this are split into sequential chunks.
 const MAX_MESSAGE_LENGTH = 4000;
+
+// Maximum file size we'll download (50 MB)
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
@@ -33,6 +38,7 @@ export class SlackChannel implements Channel {
   name = 'slack';
 
   private app: App;
+  private botToken: string;
   private botUserId: string | undefined;
   private botId: string | undefined;
   private connected = false;
@@ -59,6 +65,8 @@ export class SlackChannel implements Channel {
       );
     }
 
+    this.botToken = botToken;
+
     this.app = new App({
       token: botToken,
       appToken,
@@ -74,6 +82,19 @@ export class SlackChannel implements Channel {
       const subtype = (event as { subtype?: string }).subtype;
       // Skip list_record_comment — list items are status display only
       if (subtype === 'list_record_comment') return;
+
+      // file_share messages accompany file uploads — capture the ts so the
+      // typing-indicator reaction can attach to the upload message, then bail.
+      // The actual file processing happens in the file_shared event handler.
+      if (subtype === 'file_share') {
+        const msg = event as GenericMessageEvent;
+        if (msg.channel && msg.ts) {
+          const jid = `slack:${msg.channel}`;
+          this.lastMessageTs.set(jid, msg.ts);
+        }
+        return;
+      }
+
       if (subtype && subtype !== 'bot_message') return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
@@ -165,6 +186,111 @@ export class SlackChannel implements Channel {
         is_from_me: isBotMessage,
         is_bot_message: isBotMessage,
       });
+    });
+
+    this.app.event('file_shared', async ({ event }) => {
+      const ev = event as { file_id: string; channel_id: string };
+      const jid = `slack:${ev.channel_id}`;
+
+      try {
+        // Always call files.info first — we need file.user for the DM fallback
+        const fileInfo = await this.app.client.files.info({ file: ev.file_id });
+        const file = fileInfo.file as any;
+
+        if (!file?.url_private_download) {
+          logger.warn({ fileId: ev.file_id }, 'file_shared: no download URL, skipping');
+          return;
+        }
+
+        // Check registration — if not registered, DM the uploader and bail
+        const groups = this.opts.registeredGroups();
+        const group = groups[jid];
+        if (!group) {
+          logger.warn({ jid, fileId: ev.file_id, user: file.user }, 'file_shared: unregistered channel, skipping');
+          if (file.user) {
+            await this.app.client.chat.postMessage({
+              channel: file.user,
+              text: `I received a file in <#${ev.channel_id}> but that channel isn't registered with me yet. Ask an admin to register it if you'd like me to handle file uploads there.`,
+            });
+          }
+          return;
+        }
+
+        // Sanitize filename — strip path traversal and non-safe characters
+        const rawName = file.name ?? `slack-file-${ev.file_id}`;
+        const sanitized = path.basename(rawName).replace(/[^\w.\-]/g, '_');
+        if (!sanitized) {
+          logger.warn({ rawName }, 'file_shared: filename sanitized to empty, skipping');
+          return;
+        }
+
+        const mimeType = file.mimetype ?? 'application/octet-stream';
+        const sizeBytes = file.size ?? 0;
+        const sizeKb = (sizeBytes / 1024).toFixed(1);
+
+        // Reject files over 50MB
+        if (sizeBytes > MAX_FILE_SIZE) {
+          logger.warn({ jid, sanitized, sizeBytes }, 'file_shared: file too large, skipping');
+          this.opts.onMessage(jid, {
+            id: ev.file_id,
+            chat_jid: jid,
+            sender: '',
+            sender_name: 'slack-file-upload',
+            content: `A file was shared (${sanitized}, ${sizeKb} KB) but it exceeds the 50 MB limit and was not saved.`,
+            timestamp: new Date().toISOString(),
+            is_from_me: false,
+            is_bot_message: false,
+          });
+          return;
+        }
+
+        // Download on the host side — token never leaves this process
+        const res = await fetch(file.url_private_download, {
+          headers: { Authorization: `Bearer ${this.botToken}` },
+        });
+        if (!res.ok) {
+          throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+        }
+        const buffer = Buffer.from(await res.arrayBuffer());
+
+        // Write to group's files directory
+        const filesDir = path.join(GROUPS_DIR, group.folder, 'files');
+        await fs.mkdir(filesDir, { recursive: true });
+        const destPath = path.join(filesDir, sanitized);
+        await fs.writeFile(destPath, buffer);
+
+        logger.info({ jid, sanitized, sizeKb }, 'file_shared: file saved');
+
+        // Determine if mimetype is text-ish (Claude can summarize)
+        const isReadable =
+          mimeType.startsWith('text/') ||
+          ['application/json', 'application/pdf', 'application/csv'].includes(mimeType) ||
+          /\/(javascript|typescript|xml|yaml|toml|markdown)/.test(mimeType);
+
+        const containerPath = `/workspace/group/files/${sanitized}`;
+        const summaryInstruction = isReadable
+          ? `Since this is a readable format, read the file at ${containerPath} and include a 2\u20133 sentence summary of the contents in your reply.`
+          : `This is a binary file \u2014 just confirm receipt, no summary needed.`;
+
+        const content =
+          `File saved at ${containerPath} (${mimeType}, ${sizeKb} KB).\n\n` +
+          `Please:\n` +
+          `1. Record in memory (topic: "uploaded-files"): filename, type, size, today's date.\n` +
+          `2. Reply to the user confirming the file was saved. ${summaryInstruction}`;
+
+        this.opts.onMessage(jid, {
+          id: ev.file_id,
+          chat_jid: jid,
+          sender: '',
+          sender_name: 'slack-file-upload',
+          content,
+          timestamp: new Date().toISOString(),
+          is_from_me: false,
+          is_bot_message: false,
+        });
+      } catch (err) {
+        logger.error({ err, fileId: ev.file_id }, 'file_shared: error handling event');
+      }
     });
   }
 

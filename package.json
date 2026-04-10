@@ -5,5 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.6.0"
   }
 }

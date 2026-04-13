@@ -910,6 +910,10 @@ describe('SlackChannel', () => {
         createMessageEvent({ ts: '1704067200.000000' }),
       );
 
+      // Must call setTyping(true) first to populate typingReactionTs
+      await channel.setTyping('slack:C0123456789', true);
+      vi.clearAllMocks();
+
       await channel.setTyping('slack:C0123456789', false);
 
       expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
@@ -948,6 +952,10 @@ describe('SlackChannel', () => {
         createMessageEvent({ ts: '1704067200.000000' }),
       );
 
+      // Must call setTyping(true) first to populate typingReactionTs
+      await channel.setTyping('slack:C0123456789:1704067200.000000', true);
+      vi.clearAllMocks();
+
       await channel.setTyping('slack:C0123456789:1704067200.000000', false);
 
       expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
@@ -957,7 +965,35 @@ describe('SlackChannel', () => {
       });
     });
 
-    it('no-ops when no message ts is tracked for any JID form', async () => {
+    it('removes reaction from original message even when lastMessageTs is overwritten', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // First message arrives (ts=100)
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000100' }),
+      );
+
+      // setTyping(true) records ts=100 in typingReactionTs
+      await channel.setTyping('slack:C0123456789', true);
+
+      // Second message arrives (ts=200), overwriting lastMessageTs
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000200' }),
+      );
+
+      // setTyping(false) should remove from ts=100 (typingReactionTs), NOT ts=200
+      await channel.setTyping('slack:C0123456789', false);
+
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000100',
+        name: 'eyes',
+      });
+    });
+
+    it('no-ops setTyping(true) when no message ts is tracked', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
@@ -966,6 +1002,22 @@ describe('SlackChannel', () => {
       await channel.setTyping('slack:C0123456789', true);
 
       expect(currentApp().client.reactions.add).not.toHaveBeenCalled();
+      expect(currentApp().client.reactions.remove).not.toHaveBeenCalled();
+    });
+
+    it('no-ops setTyping(false) when no prior setTyping(true)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // A message arrives so lastMessageTs has an entry
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000000' }),
+      );
+
+      // Call setTyping(false) WITHOUT calling setTyping(true) first
+      await channel.setTyping('slack:C0123456789', false);
+
       expect(currentApp().client.reactions.remove).not.toHaveBeenCalled();
     });
 
@@ -979,7 +1031,7 @@ describe('SlackChannel', () => {
       expect(currentApp().client.reactions.add).not.toHaveBeenCalled();
     });
 
-    it('handles Slack API errors gracefully', async () => {
+    it('handles Slack API errors gracefully on add', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
@@ -995,6 +1047,28 @@ describe('SlackChannel', () => {
       // Should not throw
       await expect(
         channel.setTyping('slack:C0123456789', true),
+      ).resolves.toBeUndefined();
+    });
+
+    it('handles Slack API errors gracefully on remove', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000000' }),
+      );
+
+      // Must call setTyping(true) first to populate typingReactionTs
+      await channel.setTyping('slack:C0123456789', true);
+
+      currentApp().client.reactions.remove.mockRejectedValueOnce(
+        new Error('no_reaction'),
+      );
+
+      // Should not throw
+      await expect(
+        channel.setTyping('slack:C0123456789', false),
       ).resolves.toBeUndefined();
     });
 

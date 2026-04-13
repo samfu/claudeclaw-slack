@@ -77,6 +77,10 @@ vi.mock('@slack/bolt', () => ({
           },
         }),
       },
+      reactions: {
+        add: vi.fn().mockResolvedValue(undefined),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
     };
 
     constructor(opts: any) {
@@ -878,23 +882,152 @@ describe('SlackChannel', () => {
   // --- setTyping ---
 
   describe('setTyping', () => {
-    it('resolves without error (no-op)', async () => {
+    it('adds eyes reaction for base channel JID', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
+      await channel.connect();
 
-      // Should not throw — Slack has no bot typing indicator API
+      // Simulate a message arriving to populate lastMessageTs
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000000' }),
+      );
+
+      await channel.setTyping('slack:C0123456789', true);
+
+      expect(currentApp().client.reactions.add).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000000',
+        name: 'eyes',
+      });
+    });
+
+    it('removes eyes reaction for base channel JID', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000000' }),
+      );
+
+      await channel.setTyping('slack:C0123456789', false);
+
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000000',
+        name: 'eyes',
+      });
+    });
+
+    it('falls back to base channel JID when called with thread JID', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Message stored under base JID (slack:C0123456789)
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000000' }),
+      );
+
+      // setTyping called with thread JID (what processGroupMessages does)
+      await channel.setTyping('slack:C0123456789:1704067200.000000', true);
+
+      expect(currentApp().client.reactions.add).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000000',
+        name: 'eyes',
+      });
+    });
+
+    it('removes eyes reaction via thread JID fallback', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000000' }),
+      );
+
+      await channel.setTyping('slack:C0123456789:1704067200.000000', false);
+
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000000',
+        name: 'eyes',
+      });
+    });
+
+    it('no-ops when no message ts is tracked for any JID form', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // No messages received — lastMessageTs is empty
+      await channel.setTyping('slack:C0123456789', true);
+
+      expect(currentApp().client.reactions.add).not.toHaveBeenCalled();
+      expect(currentApp().client.reactions.remove).not.toHaveBeenCalled();
+    });
+
+    it('no-ops for thread JID when base JID also has no entry', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.setTyping('slack:C9999999999:1704067200.000000', true);
+
+      expect(currentApp().client.reactions.add).not.toHaveBeenCalled();
+    });
+
+    it('handles Slack API errors gracefully', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000000' }),
+      );
+
+      currentApp().client.reactions.add.mockRejectedValueOnce(
+        new Error('already_reacted'),
+      );
+
+      // Should not throw
       await expect(
         channel.setTyping('slack:C0123456789', true),
       ).resolves.toBeUndefined();
     });
 
-    it('accepts false without error', async () => {
-      const opts = createTestOpts();
+    it('works for DM JIDs without fallback', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({
+          'slack:D0123456789': {
+            name: 'DM',
+            folder: 'dm',
+            trigger: '@Jonesy',
+            added_at: '2024-01-01T00:00:00.000Z',
+            requiresTrigger: false,
+          },
+        })),
+      });
       const channel = new SlackChannel(opts);
+      await channel.connect();
 
-      await expect(
-        channel.setTyping('slack:C0123456789', false),
-      ).resolves.toBeUndefined();
+      await triggerMessageEvent(
+        createMessageEvent({
+          channel: 'D0123456789',
+          channelType: 'im',
+          ts: '1704067200.000000',
+        }),
+      );
+
+      await channel.setTyping('slack:D0123456789', true);
+
+      expect(currentApp().client.reactions.add).toHaveBeenCalledWith({
+        channel: 'D0123456789',
+        timestamp: '1704067200.000000',
+        name: 'eyes',
+      });
     });
   });
 

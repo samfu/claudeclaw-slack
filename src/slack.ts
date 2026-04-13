@@ -380,7 +380,20 @@ export class SlackChannel implements Channel {
   // Use emoji reactions as a typing indicator since Slack has no typing API for bots.
   // Adds eyes to the last user message when working, removes it when done.
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
-    const messageTs = this.lastMessageTs.get(jid);
+    let messageTs = this.lastMessageTs.get(jid);
+
+    // Fallback: if jid is a thread JID (slack:C...:ts), try the base channel JID.
+    // The ts is stored under the base JID at message arrival time, before the
+    // orchestrator creates the thread JID in processGroupMessages.
+    if (!messageTs) {
+      const stripped = jid.replace(/^slack:/, '');
+      const colonIdx = stripped.indexOf(':');
+      if (colonIdx !== -1) {
+        const baseJid = `slack:${stripped.slice(0, colonIdx)}`;
+        messageTs = this.lastMessageTs.get(baseJid);
+      }
+    }
+
     if (!messageTs) {
       logger.debug(
         { jid, isTyping, trackedJids: [...this.lastMessageTs.keys()] },

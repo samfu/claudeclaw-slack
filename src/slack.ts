@@ -433,6 +433,26 @@ export class SlackChannel implements Channel {
       return;
     }
 
+    // If there's already an active typing reaction (from a previous setTyping(true)
+    // that wasn't followed by setTyping(false)), remove it before adding the new one.
+    // This prevents orphaned reactions when setTyping(true) is called consecutively.
+    const existingTs = this.typingReactionTs.get(jid);
+    if (existingTs) {
+      this.typingReactionTs.delete(jid);
+      try {
+        await this.app.client.reactions.remove({
+          channel: channelId,
+          timestamp: existingTs,
+          name: 'eyes',
+        });
+      } catch (err) {
+        logger.warn(
+          { err, jid, channelId, existingTs },
+          'Failed to remove previous typing reaction',
+        );
+      }
+    }
+
     try {
       await this.app.client.reactions.add({
         channel: channelId,

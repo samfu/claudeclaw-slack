@@ -47,6 +47,10 @@ export class SlackChannel implements Channel {
   private userNameCache = new Map<string, string>();
   // Track the last inbound message ts per JID for reaction-based typing indicator
   private lastMessageTs = new Map<string, string>();
+  // Track where typing reactions were placed. Multiple messages can have eyes
+  // simultaneously (e.g. when messages are piped to an active container).
+  // On setTyping(false), all tracked reactions are removed.
+  private typingReactionTs = new Map<string, string[]>();
 
   private opts: SlackChannelOpts;
 
@@ -380,14 +384,67 @@ export class SlackChannel implements Channel {
   // Use emoji reactions as a typing indicator since Slack has no typing API for bots.
   // Adds eyes to the last user message when working, removes it when done.
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
+    // Parse channel from JID (needed for both add and remove)
+    const stripped = jid.replace(/^slack:/, '');
+    const colonIdx = stripped.indexOf(':');
+    const channelId = colonIdx === -1 ? stripped : stripped.slice(0, colonIdx);
+
+    if (!isTyping) {
+      // Remove all tracked typing reactions for this JID.
+      // Multiple reactions can exist when messages are piped to an active container.
+      const reactionTsList = this.typingReactionTs.get(jid) || [];
+      if (reactionTsList.length === 0) {
+        // Fallback: check base JID if called with thread JID
+        if (colonIdx !== -1) {
+          const baseJid = `slack:${stripped.slice(0, colonIdx)}`;
+          const baseTsList = this.typingReactionTs.get(baseJid) || [];
+          if (baseTsList.length > 0) {
+            this.typingReactionTs.delete(baseJid);
+            for (const ts of baseTsList) {
+              try {
+                await this.app.client.reactions.remove({
+                  channel: channelId,
+                  timestamp: ts,
+                  name: 'eyes',
+                });
+              } catch (err) {
+                logger.warn(
+                  { err, jid: baseJid, channelId, reactionTs: ts },
+                  'Failed to remove typing reaction',
+                );
+              }
+            }
+            return;
+          }
+        }
+        logger.debug({ jid }, 'setTyping(false): no active typing reactions to remove');
+        return;
+      }
+      this.typingReactionTs.delete(jid);
+      for (const ts of reactionTsList) {
+        try {
+          await this.app.client.reactions.remove({
+            channel: channelId,
+            timestamp: ts,
+            name: 'eyes',
+          });
+        } catch (err) {
+          logger.warn(
+            { err, jid, channelId, reactionTs: ts },
+            'Failed to remove typing reaction',
+          );
+        }
+      }
+      return;
+    }
+
+    // For adding, look up the latest message ts
     let messageTs = this.lastMessageTs.get(jid);
 
     // Fallback: if jid is a thread JID (slack:C...:ts), try the base channel JID.
     // The ts is stored under the base JID at message arrival time, before the
     // orchestrator creates the thread JID in processGroupMessages.
     if (!messageTs) {
-      const stripped = jid.replace(/^slack:/, '');
-      const colonIdx = stripped.indexOf(':');
       if (colonIdx !== -1) {
         const baseJid = `slack:${stripped.slice(0, colonIdx)}`;
         messageTs = this.lastMessageTs.get(baseJid);
@@ -396,35 +453,26 @@ export class SlackChannel implements Channel {
 
     if (!messageTs) {
       logger.debug(
-        { jid, isTyping, trackedJids: [...this.lastMessageTs.keys()] },
-        'setTyping: no message ts tracked',
+        { jid, trackedJids: [...this.lastMessageTs.keys()] },
+        'setTyping(true): no message ts tracked',
       );
       return;
     }
 
-    // Parse channel from JID
-    const stripped = jid.replace(/^slack:/, '');
-    const colonIdx = stripped.indexOf(':');
-    const channelId = colonIdx === -1 ? stripped : stripped.slice(0, colonIdx);
-
     try {
-      if (isTyping) {
-        await this.app.client.reactions.add({
-          channel: channelId,
-          timestamp: messageTs,
-          name: 'eyes',
-        });
-      } else {
-        await this.app.client.reactions.remove({
-          channel: channelId,
-          timestamp: messageTs,
-          name: 'eyes',
-        });
-      }
+      await this.app.client.reactions.add({
+        channel: channelId,
+        timestamp: messageTs,
+        name: 'eyes',
+      });
+      // Append to the list of active reactions for this JID
+      const list = this.typingReactionTs.get(jid) || [];
+      list.push(messageTs);
+      this.typingReactionTs.set(jid, list);
     } catch (err) {
-      logger.debug(
-        { err, jid, channelId, messageTs, isTyping },
-        'Reaction error',
+      logger.warn(
+        { err, jid, channelId, messageTs },
+        'Failed to add typing reaction',
       );
     }
   }

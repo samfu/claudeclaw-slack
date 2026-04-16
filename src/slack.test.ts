@@ -993,7 +993,7 @@ describe('SlackChannel', () => {
       });
     });
 
-    it('cleans up previous reaction when setTyping(true) is called consecutively', async () => {
+    it('removes all reactions when multiple setTyping(true) calls precede setTyping(false)', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
@@ -1002,66 +1002,90 @@ describe('SlackChannel', () => {
       await triggerMessageEvent(
         createMessageEvent({ ts: '1704067200.000100' }),
       );
-
-      // First setTyping(true) — eyes on ts=100
       await channel.setTyping('slack:C0123456789', true);
-      expect(currentApp().client.reactions.add).toHaveBeenCalledWith({
-        channel: 'C0123456789',
-        timestamp: '1704067200.000100',
-        name: 'eyes',
-      });
 
-      // Second message arrives, overwriting lastMessageTs
+      // Second message arrives
       await triggerMessageEvent(
         createMessageEvent({ ts: '1704067200.000200' }),
       );
-
-      // Second setTyping(true) — should remove eyes from ts=100, then add to ts=200
       await channel.setTyping('slack:C0123456789', true);
 
-      // Should have removed the first reaction
-      expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
-        channel: 'C0123456789',
-        timestamp: '1704067200.000100',
-        name: 'eyes',
-      });
-
-      // Should have added to the new message
-      expect(currentApp().client.reactions.add).toHaveBeenCalledWith({
-        channel: 'C0123456789',
-        timestamp: '1704067200.000200',
-        name: 'eyes',
-      });
-    });
-
-    it('removes all reactions after consecutive setTyping(true) then setTyping(false)', async () => {
-      const opts = createTestOpts();
-      const channel = new SlackChannel(opts);
-      await channel.connect();
-
-      // First message
+      // Third message arrives
       await triggerMessageEvent(
-        createMessageEvent({ ts: '1704067200.000100' }),
-      );
-      await channel.setTyping('slack:C0123456789', true);
-
-      // Second message
-      await triggerMessageEvent(
-        createMessageEvent({ ts: '1704067200.000200' }),
+        createMessageEvent({ ts: '1704067200.000300' }),
       );
       await channel.setTyping('slack:C0123456789', true);
 
       vi.clearAllMocks();
 
-      // Final removal — should clean up the only remaining reaction (ts=200)
+      // Single setTyping(false) should remove all three reactions
       await channel.setTyping('slack:C0123456789', false);
 
-      expect(currentApp().client.reactions.remove).toHaveBeenCalledTimes(1);
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledTimes(3);
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000100',
+        name: 'eyes',
+      });
       expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
         channel: 'C0123456789',
         timestamp: '1704067200.000200',
         name: 'eyes',
       });
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000300',
+        name: 'eyes',
+      });
+    });
+
+    it('clears tracking after setTyping(false) so subsequent false is a no-op', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000100' }),
+      );
+      await channel.setTyping('slack:C0123456789', true);
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000200' }),
+      );
+      await channel.setTyping('slack:C0123456789', true);
+
+      // First false removes both
+      await channel.setTyping('slack:C0123456789', false);
+      vi.clearAllMocks();
+
+      // Second false should be a no-op
+      await channel.setTyping('slack:C0123456789', false);
+      expect(currentApp().client.reactions.remove).not.toHaveBeenCalled();
+    });
+
+    it('continues removing remaining reactions if one removal fails', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000100' }),
+      );
+      await channel.setTyping('slack:C0123456789', true);
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000200' }),
+      );
+      await channel.setTyping('slack:C0123456789', true);
+
+      // First removal fails, second should still proceed
+      currentApp().client.reactions.remove
+        .mockRejectedValueOnce(new Error('no_reaction'))
+        .mockResolvedValueOnce(undefined);
+
+      await channel.setTyping('slack:C0123456789', false);
+
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledTimes(2);
     });
 
     it('no-ops setTyping(true) when no message ts is tracked', async () => {
@@ -1171,6 +1195,41 @@ describe('SlackChannel', () => {
       expect(currentApp().client.reactions.add).toHaveBeenCalledWith({
         channel: 'D0123456789',
         timestamp: '1704067200.000000',
+        name: 'eyes',
+      });
+    });
+
+    it('removes reactions tracked under base JID when called with thread JID', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Messages stored under base JID via the piping path
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000100' }),
+      );
+      await channel.setTyping('slack:C0123456789', true);
+
+      await triggerMessageEvent(
+        createMessageEvent({ ts: '1704067200.000200' }),
+      );
+      await channel.setTyping('slack:C0123456789', true);
+
+      vi.clearAllMocks();
+
+      // processGroupMessages calls setTyping(false) with thread JID
+      await channel.setTyping('slack:C0123456789:1704067200.000000', false);
+
+      // Should fall back to base JID and remove both
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledTimes(2);
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000100',
+        name: 'eyes',
+      });
+      expect(currentApp().client.reactions.remove).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000200',
         name: 'eyes',
       });
     });
